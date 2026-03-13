@@ -1,0 +1,27 @@
+{
+  "name": "victoria-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Bot de reactivación de citas WhatsApp con IA",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "victoria",
+    "reactivacion"
+  ],
+  "author": "AHJ ENDE",
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "mysql2": "^3.18.2",
+    "node-cron": "^4.2.1"
+  }
+}
