@@ -1,6 +1,7 @@
 // utils/scoring.js
 import { SCORING, PATRONES, TEMPERATURA } from '../config/constants.js';
 
+
 export function calcularScoring(mensaje, tiempoRespuesta) {
   let puntos = 0;
   const msgLower = mensaje.toLowerCase();
@@ -19,12 +20,14 @@ export function calcularScoring(mensaje, tiempoRespuesta) {
     puntos += SCORING.MENSAJE_CORTO;
   }
 
-  // Patrones de interés
-  if (PATRONES.INTERES.test(msgLower)) {
+  // Interés positivo SOLO si no hay rechazo en el mismo mensaje
+  // (evita que "no me interesa" cuente como señal positiva)
+  if (PATRONES.INTERES.test(msgLower) && !PATRONES.RECHAZO.test(msgLower)) {
     puntos += SCORING.MUESTRA_INTERES;
   }
 
-  if (PATRONES.PRECIO.test(msgLower)) {
+  // Precio positivo SOLO si no hay queja de dinero en el mismo mensaje
+  if (PATRONES.PRECIO.test(msgLower) && !PATRONES.DINERO.test(msgLower)) {
     puntos += SCORING.PREGUNTA_PRECIO;
   }
 
@@ -80,17 +83,22 @@ export function obtenerTemperatura(scoring) {
 }
 
 export function debeTransferir(scoring, historial) {
-  // Transferir si:
-  // 1. Scoring es CALIENTE (>56)
-  // 2. O si hace 3+ preguntas específicas
+  const mensajesUsuario = historial.filter(m => m.role === 'user');
+
+  // Mínimo 5 intercambios reales antes de transferir
+  if (mensajesUsuario.length < 5) return false;
+
+  // Transferir si scoring muy alto Y el último mensaje no es una objeción
   if (scoring >= TEMPERATURA.CALIENTE.min) {
+    const ultimoUsuario = mensajesUsuario[mensajesUsuario.length - 1]?.content?.toLowerCase() || '';
+    const esObjecion = PATRONES.DINERO.test(ultimoUsuario) ||
+                       PATRONES.RECHAZO.test(ultimoUsuario) ||
+                       PATRONES.TIEMPO.test(ultimoUsuario);
+    if (esObjecion) return false; // maneja la objeción antes de transferir
     return true;
   }
 
-  const ultimosMensajes = historial.slice(-6);
-  const preguntasUsuario = ultimosMensajes.filter(m => 
-    m.role === 'user' && m.content.includes('?')
-  );
-
-  return preguntasUsuario.length >= 3;
+  // O si pide contacto explícitamente
+  const ultimoUsuario = mensajesUsuario[mensajesUsuario.length - 1]?.content?.toLowerCase() || '';
+  return PATRONES.CONTACTO.test(ultimoUsuario);
 }

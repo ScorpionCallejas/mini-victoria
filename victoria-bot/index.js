@@ -1,10 +1,11 @@
 // index.js
 import express from 'express';
 import dotenv from 'dotenv';
-import { verificarConexion, enviarMensaje } from './modules/evolution.js';
-import { conectarDB, obtenerProspectosNoAtendidos } from './modules/database.js';
+import { verificarConexion, enviarMensaje, configurarWebhook } from './modules/evolution.js';
+import { getPendientes, guardarChatId } from './modules/api.js';
 import { procesarMensaje } from './handlers/message.js';
-import { generarMensajeInicial } from './workflows/reactivacion.js';
+import { generarMensajeInicial } from './modules/ai.js';
+import { iniciarPolling, registrarProspecto } from './modules/poller.js';
 
 dotenv.config();
 
@@ -14,31 +15,44 @@ app.use(express.json());
 // Map para almacenar prospectos por teléfono
 const prospectosPorTelefono = new Map();
 
+// Busca un prospecto comparando los últimos 10 dígitos del teléfono
+// Resuelve el problema de México donde WA a veces quita/agrega el "1" (52 vs 521)
+function buscarProspecto(telefonoEntrante) {
+  const sufijo = telefonoEntrante.slice(-10);
+  for (const [tel, prospecto] of prospectosPorTelefono) {
+    if (tel.slice(-10) === sufijo) return prospecto;
+  }
+  return null;
+}
+
 // ============================================
 // WEBHOOK - RECIBIR MENSAJES DE WHATSAPP
 // ============================================
-app.post('/webhook', async (req, res) => {
+
+async function procesarWebhook(req, res) {
   try {
-    const { event, data } = req.body;
+    const body  = req.body;
+    const event = body.event || '';
 
-    // Solo procesar mensajes entrantes
-    if (event === 'messages.upsert') {
-      const mensaje = data.messages?.[0];
-      
-      if (!mensaje || mensaje.key.fromMe) {
-        return res.sendStatus(200);
-      }
+    console.log(`\n🔔 WEBHOOK [${event || 'sin-evento'}] — ${JSON.stringify(body).substring(0, 150)}`);
 
-      const telefono = mensaje.key.remoteJid.replace('@s.whatsapp.net', '');
-      
-      // Buscar prospecto asociado a este teléfono
-      const prospecto = prospectosPorTelefono.get(telefono);
-      
+    if (event !== 'messages.upsert') return res.sendStatus(200);
+
+    const mensajes = body.data?.messages || [];
+    for (const mensaje of mensajes) {
+      if (mensaje.key?.fromMe) continue;
+
+      const remoteJid = mensaje.key?.remoteJid || '';
+      if (!remoteJid.endsWith('@s.whatsapp.net')) continue;
+
+      const telefono  = remoteJid.replace('@s.whatsapp.net', '');
+      const prospecto = buscarProspecto(telefono);
+
       if (prospecto) {
-        console.log(`\n📱 Mensaje entrante de: ${prospecto.nombre_completo}`);
+        console.log(`📱 Mensaje de: ${prospecto.nombre_completo} (${telefono})`);
         await procesarMensaje(mensaje, prospecto);
       } else {
-        console.log(`⚠️  Mensaje de número no registrado: ${telefono}`);
+        console.log(`⚠️  Número no en campaña: ${telefono} | Activos: [${[...prospectosPorTelefono.keys()].join(', ')}]`);
       }
     }
 
@@ -47,7 +61,9 @@ app.post('/webhook', async (req, res) => {
     console.error('❌ Error en webhook:', error);
     res.sendStatus(500);
   }
-});
+}
+
+app.post('/webhook', procesarWebhook);
 
 // ============================================
 // HEALTH CHECK
@@ -75,12 +91,23 @@ async function iniciarCampana() {
     }
     console.log('✅ WhatsApp conectado');
 
-    // 2. Conectar a base de datos
-    await conectarDB();
-    console.log('✅ Base de datos conectada');
+    // 2. Obtener prospectos (modo test = solo tu número, sin tocar la BD)
+    let prospectos;
 
-    // 3. Obtener prospectos
-    const prospectos = await obtenerProspectosNoAtendidos(30);
+    if (process.env.TEST_MODE === 'true') {
+      console.log('🧪 MODO TEST — usando contacto de prueba');
+      prospectos = [{
+        id_cit:          9999,
+        nombre_completo: process.env.TEST_NOMBRE || 'Test',
+        telefono:        process.env.TEST_TEL,
+        fecha_cita:      new Date(Date.now() - 5 * 24 * 60 * 60 * 1000), // hace 5 días
+        modalidad:       'Preparatoria',
+        observaciones:   'Contacto de prueba',
+        asesor:          'Equipo Victoria'
+      }];
+    } else {
+      prospectos = await getPendientes(process.env.MAX_PROSPECTOS_POR_JORNADA || 30);
+    }
     
     if (prospectos.length === 0) {
       console.log('ℹ️  No hay prospectos pendientes en este momento');
@@ -103,13 +130,19 @@ async function iniciarCampana() {
         }
 
         // Generar mensaje personalizado
-        const mensajeInicial = generarMensajeInicial(prospecto);
+        const mensajeInicial = await generarMensajeInicial(prospecto);
 
         // Enviar mensaje
         await enviarMensaje(telefono, mensajeInicial);
-        
-        // Registrar prospecto en el mapa
+
+        // Registrar prospecto en el mapa y en el poller
         prospectosPorTelefono.set(telefono, prospecto);
+        registrarProspecto(telefono);
+
+        // Persistir chat_id en BD (solo si no es modo test)
+        if (process.env.TEST_MODE !== 'true') {
+          await guardarChatId(prospecto.id_cit, `${telefono}@s.whatsapp.net`);
+        }
 
         console.log(`✅ [${i + 1}/${prospectos.length}] ${prospecto.nombre_completo} - ${telefono}`);
 
@@ -171,9 +204,13 @@ app.listen(PORT, async () => {
   try {
     const whatsappOk = await verificarConexion();
     console.log(whatsappOk ? '✅ WhatsApp conectado' : '❌ WhatsApp desconectado');
-    
-    await conectarDB();
-    console.log('✅ Base de datos conectada\n');
+
+    // Iniciar polling (reemplaza webhook que no funciona en local)
+    iniciarPolling(buscarProspecto, procesarMensaje);
+
+    if (process.env.TEST_MODE === 'true') {
+      console.log('🧪 MODO TEST activo — BD real no se toca\n');
+    }
 
     // Mostrar menú
     mostrarMenu();

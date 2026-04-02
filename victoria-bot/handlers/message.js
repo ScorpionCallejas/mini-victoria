@@ -1,104 +1,76 @@
 // handlers/message.js
-import { generarRespuesta, generarSystemPrompt, obtenerTemperaturaLLM } from '../modules/ai.js';
-import { guardarConversacion } from '../modules/database.js';
-import { enviarMensaje } from '../modules/evolution.js';
-import { calcularScoring, actualizarScoring, obtenerTemperatura, debeTransferir } from '../utils/scoring.js';
-import { generarMensajeTransferencia } from '../workflows/reactivacion.js';
+// Punto de entrada de cada mensaje entrante.
+// Delega el procesamiento al stageRouter y ejecuta la transferencia cuando corresponde.
+
+import { guardarConversacion }                  from '../modules/api.js';
+import { enviarMensaje }                        from '../modules/evolution.js';
+import { parsearMensajes, delayHumano, delayEntrePartes } from '../modules/ai.js';
+import { generarMensajeTransferencia }          from '../workflows/reactivacion.js';
+import { inicializarConv }                      from '../core/stageEngine.js';
+import { routear }                              from '../core/stageRouter.js';
+import { ejecutarTransferencia }                from '../core/transferManager.js';
+import { extraerTexto }                         from '../utils/conversacion.js';
 
 const conversacionesActivas = new Map();
 
 export async function procesarMensaje(mensaje, prospecto) {
   try {
-    const telefono = mensaje.key.remoteJid.replace('@s.whatsapp.net', '');
-    const textoUsuario = mensaje.message?.conversation || 
-                         mensaje.message?.extendedTextMessage?.text || '';
+    const telefono     = mensaje.key.remoteJid.replace('@s.whatsapp.net', '');
+    const textoUsuario = extraerTexto(mensaje);
 
     if (!textoUsuario) return;
 
-    console.log(`\n📨 Mensaje de ${prospecto.nombre_completo}: ${textoUsuario}`);
+    console.log(`\n📨 ${prospecto.nombre_completo}: "${textoUsuario}"`);
 
     // Obtener o crear conversación
-    let conv = conversacionesActivas.get(prospecto.id_cit) || {
-      id_cit: prospecto.id_cit,
-      prospecto: prospecto,
-      historial: [],
-      scoring: 30,
-      temperatura: 'FRIO',
-      ultimaRespuesta: Date.now()
-    };
+    let conv = conversacionesActivas.get(prospecto.id_cit)
+            || inicializarConv(prospecto);
 
-    // Calcular tiempo de respuesta
-    const tiempoRespuesta = Date.now() - conv.ultimaRespuesta;
+    // ── Procesar mensaje ──────────────────────────────────────────────────
+    const resultado = await routear(textoUsuario, conv);
 
-    // Calcular scoring
-    const nuevosPuntos = calcularScoring(textoUsuario, tiempoRespuesta);
-    conv.scoring = actualizarScoring(conv.scoring, nuevosPuntos);
-    conv.temperatura = obtenerTemperatura(conv.scoring);
+    // ── Transferencia al consultor ────────────────────────────────────────
+    if (resultado.accion === 'TRANSFERIR') {
+      // 1. Mensaje al lead
+      const msgTransferencia = await generarMensajeTransferencia(prospecto, conv.scoring);
+      await delayHumano(msgTransferencia.length);
+      await enviarMensaje(telefono, msgTransferencia);
 
-    console.log(`📊 Scoring: ${conv.scoring} | Temperatura: ${conv.temperatura} | Puntos: ${nuevosPuntos > 0 ? '+' : ''}${nuevosPuntos}`);
+      conv.historial.push({ role: 'assistant', content: msgTransferencia, timestamp: new Date() });
 
-    // Agregar mensaje del usuario al historial
-    conv.historial.push({
-      role: 'user',
-      content: textoUsuario,
-      timestamp: new Date()
-    });
+      // 2. Brief al consultor
+      await ejecutarTransferencia(prospecto, conv);
 
-    // Verificar si debe transferir
-    if (debeTransferir(conv.scoring, conv.historial)) {
-      const mensajeTransferencia = generarMensajeTransferencia(prospecto, conv.scoring);
-      await enviarMensaje(telefono, mensajeTransferencia);
-      
-      conv.historial.push({
-        role: 'assistant',
-        content: mensajeTransferencia,
-        timestamp: new Date()
-      });
+      // 3. Persistir y cerrar
+      if (process.env.TEST_MODE !== 'true') {
+        await guardarConversacion(conv.id_cit, conv.historial, conv.scoring, 'TRANSFERIDA');
+      }
 
-      await guardarConversacion(
-        conv.id_cit, 
-        conv.historial, 
-        conv.scoring, 
-        'TRANSFERIDA'
-      );
-
-      console.log(`🔄 Lead TRANSFERIDO - Scoring: ${conv.scoring}`);
+      const msgs = conv.historial.filter(m => m.role === 'user');
+      console.log(`🔄 Lead TRANSFERIDO — Scoring: ${conv.scoring} | Mensajes: ${msgs.length} | Etapa: ${conv.etapa}`);
       conversacionesActivas.delete(prospecto.id_cit);
       return;
     }
 
-    // Generar respuesta con IA
-    const systemPrompt = generarSystemPrompt(prospecto, conv);
-    const temperaturaLLM = obtenerTemperaturaLLM(conv.scoring);
-    
-    const respuesta = await generarRespuesta(
-      systemPrompt, 
-      conv.historial, 
-      temperaturaLLM
-    );
+    // ── Enviar respuesta normal ───────────────────────────────────────────
+    const partes = parsearMensajes(resultado.respuesta);
+    await delayHumano(partes[0].length);
 
-    // Enviar respuesta
-    await enviarMensaje(telefono, respuesta);
+    const textoCompleto = [];
+    for (let i = 0; i < partes.length; i++) {
+      if (i > 0) await delayEntrePartes(partes[i].length);
+      await enviarMensaje(telefono, partes[i]);
+      textoCompleto.push(partes[i]);
+      console.log(`📤 [${i + 1}/${partes.length}] ${partes[i].substring(0, 60)}...`);
+    }
 
-    // Agregar respuesta al historial
-    conv.historial.push({
-      role: 'assistant',
-      content: respuesta,
-      timestamp: new Date()
-    });
-
+    conv.historial.push({ role: 'assistant', content: textoCompleto.join('\n'), timestamp: new Date() });
     conv.ultimaRespuesta = Date.now();
     conversacionesActivas.set(prospecto.id_cit, conv);
 
-    // Guardar en BD
-    await guardarConversacion(
-      conv.id_cit,
-      conv.historial,
-      conv.scoring,
-      conv.temperatura
-    );
-
-    console.log(`✅ Respuesta enviada: ${respuesta.substring(0, 50)}...`);
+    if (process.env.TEST_MODE !== 'true') {
+      await guardarConversacion(conv.id_cit, conv.historial, conv.scoring, conv.temperatura);
+    }
 
   } catch (error) {
     console.error('❌ Error procesando mensaje:', error);
